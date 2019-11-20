@@ -218,12 +218,13 @@ func (rf *Raft) newThan(index, term int) bool {
 func (rf *Raft) checkApplied() {
 	for rf.lastApplied < rf.commitIndex {
 		rf.lastApplied++
-		DPrintf("raft %v applied %v", rf.me, rf.lastApplied)
-		rf.applyCh <- ApplyMsg{
+		applyMsg := ApplyMsg{
 			CommandValid: true,
 			Command:      rf.log[rf.lastApplied].Command,
 			CommandIndex: rf.lastApplied,
 		}
+		DPrintf("raft %v applied %v: %v", rf.me, rf.lastApplied, applyMsg)
+		rf.applyCh <- applyMsg
 	}
 }
 

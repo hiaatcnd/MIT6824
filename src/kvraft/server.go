@@ -195,12 +195,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 			kv.mu.Unlock()
 
 			mID := MergeID{op.ClientID, op.RequestID}
+			kv.mu.Lock()
 			if appliedCh, exist := kv.appliedChs[mID]; exist {
 				close(*appliedCh)
-				kv.mu.Lock()
 				delete(kv.appliedChs, mID)
-				kv.mu.Unlock()
 			}
+			kv.mu.Unlock()
 			DPrintf("kv %v done %v", kv.me, applyMsg)
 		}
 	}()

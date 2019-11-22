@@ -339,9 +339,9 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	DPrintf("raft %v receive AppendEntries: %v", rf.me, args)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("raft %v receive AppendEntries: %v", rf.me, args)
 	reply.Term = rf.currentTerm
 	reply.Success = false
 	reply.ConflictTerm = null
@@ -386,7 +386,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// Append any new entries not already in the log
 	rf.log = append(rf.log, args.Entries[j:]...)
 	rf.persist()
-	DPrintf("raft %v logs: %v", rf.me, rf.log)
+	if j < len(args.Entries) {
+		DPrintf("raft %v logs: %v", rf.me, rf.log)
+	}
 
 	// If leaderCommit > commitIndex, set commitIndex = min(leaderCommit, index of last new entry)
 	if args.LeaderCommit > rf.commitIndex {

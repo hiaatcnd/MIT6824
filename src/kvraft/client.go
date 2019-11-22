@@ -1,6 +1,9 @@
 package raftkv
 
-import "labrpc"
+import (
+	"labrpc"
+	"time"
+)
 import "crypto/rand"
 import "math/big"
 
@@ -43,8 +46,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 //
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
-	DPrintf("Client Get %v", key)
 	ck.requestNum++
+	DPrintf("Client %v Request %v Get %v", ck.id, ck.requestNum, key)
 	for {
 		args := GetArgs{
 			Key:       key,
@@ -52,16 +55,16 @@ func (ck *Clerk) Get(key string) string {
 			RequestID: ck.requestNum,
 		}
 		var reply GetReply
-		if !ck.servers[ck.leaderIdx].Call("KVServer.Get", &args, &reply) {
-			continue
-		}
-		if reply.WrongLeader {
+		//DPrintf("Client %v Request %v call server %v args: %v", ck.id, ck.requestNum, ck.leaderIdx, args)
+		if !ck.servers[ck.leaderIdx].Call("KVServer.Get", &args, &reply) || reply.WrongLeader {
+			//DPrintf("Client %v Request %v Wrong Leader or cannot connected", ck.id, ck.requestNum)
 			ck.leaderIdx = (ck.leaderIdx + 1) % len(ck.servers)
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
-		DPrintf("receive :%v", reply)
+		DPrintf("Client %v Request %v receive :%v", ck.id, ck.requestNum, reply)
 		if reply.Err != "" {
-			ck.requestNum++
+			time.Sleep(10 * time.Millisecond)
 			continue
 		}
 		return reply.Value
@@ -80,8 +83,8 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	DPrintf("Client %v: %v->%v", op, key, value)
 	ck.requestNum++
+	//DPrintf("Client %v Request %v %v: %v->%v", ck.id, ck.requestNum, op, key, value)
 	for {
 		args := PutAppendArgs{
 			Key:       key,
@@ -91,16 +94,14 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			RequestID: ck.requestNum,
 		}
 		var reply PutAppendReply
-		if !ck.servers[ck.leaderIdx].Call("KVServer.PutAppend", &args, &reply) {
-			continue
-		}
-		if reply.WrongLeader {
+		//DPrintf("Client %v Request %v call server %v args: %v", ck.id, ck.requestNum, ck.leaderIdx, args)
+		if !ck.servers[ck.leaderIdx].Call("KVServer.PutAppend", &args, &reply) || reply.WrongLeader {
+			//DPrintf("Client %v Request %v Wrong Leader or cannot connected", ck.id, ck.requestNum)
 			ck.leaderIdx = (ck.leaderIdx + 1) % len(ck.servers)
 			continue
 		}
-		DPrintf("receive :%v", reply)
+		DPrintf("Client %v Request %v receive :%v", ck.id, ck.requestNum, reply)
 		if reply.Err != "" {
-			ck.requestNum++
 			continue
 		}
 		return

@@ -9,18 +9,13 @@ import (
 	"time"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
 		log.Printf(format, a...)
 	}
 	return
-}
-
-type ClientReqID struct {
-	Clerk   int64
-	Request int64
 }
 
 type OpType int
@@ -35,10 +30,16 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Op    OpType
-	Key   string
-	Value string
-	CrID  ClientReqID
+	Op        OpType
+	Key       string
+	Value     string
+	ClientID  int64
+	RequestID int64
+}
+
+type MergeID struct {
+	c int64
+	r int64
 }
 
 type KVServer struct {
@@ -52,114 +53,76 @@ type KVServer struct {
 	// Your definitions here.
 	db            map[string]string
 	clerkID2reqID map[int64]int64
-	appliedChs    map[ClientReqID]chan struct{}
+	appliedChs    map[MergeID]*chan struct{}
+	killCh        chan struct{}
+}
+
+func (kv *KVServer) getCh(clientID, requestID int64) *chan struct{} {
+	mID := MergeID{clientID, requestID}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	if _, ok := kv.appliedChs[mID]; !ok {
+		ch := make(chan struct{})
+		kv.appliedChs[mID] = &ch
+	}
+	return kv.appliedChs[mID]
+}
+
+func timeoutCh(ch *chan struct{}) bool {
+	select {
+	case <-*ch:
+		return true
+	case <-time.After(time.Second):
+		return false
+	}
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	//DPrintf("receive a Get request from client %v of request %v: get %v", args.ClerkID, args.RequestID, args.Key)
+	//DPrintf("kv %v receive a Get request from client %v of request %v: get %v", kv.me, args.ClerkID, args.RequestID, args.Key)
 	// Your code here.
-	_, isLeader := kv.rf.GetState()
+	reply.WrongLeader = true
+
+	op := Op{OpGet, args.Key, "", args.ClerkID, args.RequestID}
+	ch := kv.getCh(args.ClerkID, args.RequestID)
+	_, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
-		reply.WrongLeader = true
 		return
 	}
-	reply.WrongLeader = false
 
-	kv.mu.Lock()
-	if kv.clerkID2reqID[args.ClerkID] >= args.RequestID {
+	if timeoutCh(ch) {
+		DPrintf("kv %v applied a Get request from client %v of request %v: get %v", kv.me, args.ClerkID, args.RequestID, args.Key)
+		kv.mu.Lock()
+		reply.WrongLeader = false
 		reply.Value = kv.db[args.Key]
 		kv.mu.Unlock()
-		return
-	} else {
-		kv.clerkID2reqID[args.ClerkID] = args.RequestID
-	}
-	kv.mu.Unlock()
-
-	crID := ClientReqID{args.ClerkID, args.RequestID}
-	op := Op{OpGet, args.Key, "", crID}
-	kv.rf.Start(op)
-	appliedCh := make(chan struct{})
-	kv.mu.Lock()
-	kv.appliedChs[crID] = appliedCh
-	kv.mu.Unlock()
-	defer func() {
-		close(appliedCh)
-		kv.mu.Lock()
-		delete(kv.appliedChs, crID)
-		kv.mu.Unlock()
-	}()
-
-	select {
-	case <-appliedCh:
-	case <-time.After(3 * time.Second):
-		reply.Err = "Timeout"
-		return
 	}
 
-	DPrintf("applied a Get request from client %v of request %v: get %v", args.ClerkID, args.RequestID, args.Key)
-
-	kv.mu.Lock()
-	v := kv.db[args.Key]
-	reply.Value = v
-	kv.mu.Unlock()
+	DPrintf("kv %v reply: %v", kv.me, reply)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	//DPrintf("receive a PUTAPPEND request from client %v of request %v: %v key=%v value=%v", args.ClerkID, args.RequestID, args.Op, args.Key, args.Value)
+	//DPrintf("kv %v receive a PUTAPPEND request from client %v of request %v: %v key=%v value=%v", kv.me, args.ClerkID, args.RequestID, args.Op, args.Key, args.Value)
 	// Your code here.
-	_, isLeader := kv.rf.GetState()
-	if !isLeader {
-		reply.WrongLeader = true
-		return
-	}
-	reply.WrongLeader = false
+	reply.WrongLeader = true
 
-	kv.mu.Lock()
-	if kv.clerkID2reqID[args.ClerkID] >= args.RequestID {
-		kv.mu.Unlock()
-		return
-	} else {
-		kv.clerkID2reqID[args.ClerkID] = args.RequestID
-	}
-	kv.mu.Unlock()
-
-	crID := ClientReqID{args.ClerkID, args.RequestID}
 	opType := OpPut
 	if args.Op == "Append" {
+		reply.WrongLeader = true
 		opType = OpAppend
 	}
-	op := Op{opType, args.Key, args.Value, crID}
-	kv.rf.Start(op)
-	appliedCh := make(chan struct{})
-	kv.mu.Lock()
-	kv.appliedChs[crID] = appliedCh
-	kv.mu.Unlock()
-	defer func() {
-		close(appliedCh)
-		kv.mu.Lock()
-		delete(kv.appliedChs, crID)
-		kv.mu.Unlock()
-	}()
-
-	select {
-	case <-appliedCh:
-	case <-time.After(3 * time.Second):
-		reply.Err = "Timeout"
+	op := Op{opType, args.Key, args.Value, args.ClerkID, args.RequestID}
+	ch := kv.getCh(args.ClerkID, args.RequestID)
+	_, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
 		return
 	}
 
-	DPrintf("applied a PUTAPPEND request from client %v of request %v: %v key=%v value=%v", args.ClerkID, args.RequestID, args.Op, args.Key, args.Value)
-
-	kv.mu.Lock()
-	if opType == OpPut {
-		kv.db[args.Key] = args.Value
-	} else if opType == OpAppend {
-		kv.db[args.Key] = kv.db[args.Key] + args.Value
-	} else {
-		reply.Err = "Unknown Op type"
+	if timeoutCh(ch) {
+		DPrintf("kv %v applied a PUTAPPEND request from client %v of request %v: %v key=%v value=%v", kv.me, args.ClerkID, args.RequestID, args.Op, args.Key, args.Value)
+		reply.WrongLeader = false
 	}
-	DPrintf("reply: %v", reply)
-	kv.mu.Unlock()
+
+	DPrintf("kv %v reply: %v", kv.me, reply)
 }
 
 //
@@ -171,6 +134,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+	kv.killCh <- struct{}{}
 }
 
 //
@@ -191,7 +155,6 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
-	labgob.Register(ClientReqID{})
 
 	kv := new(KVServer)
 	kv.me = me
@@ -204,22 +167,41 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.db = make(map[string]string)
 	kv.clerkID2reqID = make(map[int64]int64)
-	kv.appliedChs = make(map[ClientReqID]chan struct{})
+	kv.appliedChs = make(map[MergeID]*chan struct{})
+	kv.killCh = make(chan struct{}, 1)
 
 	// You may need initialization code here.
 	go func() {
 		for {
+			var applyMsg raft.ApplyMsg
 			select {
-			case applyMsg := <-kv.applyCh:
-				DPrintf("apply: %v", applyMsg)
-				op := applyMsg.Command.(Op)
-				kv.mu.Lock()
-				appliedCh, exist := kv.appliedChs[op.CrID]
-				if exist {
-					appliedCh <- struct{}{}
+			case <-kv.killCh:
+				return
+			case applyMsg = <-kv.applyCh:
+			}
+			DPrintf("kv %v apply: %v", kv.me, applyMsg)
+			op := applyMsg.Command.(Op)
+
+			kv.mu.Lock()
+			reqID, exist := kv.clerkID2reqID[op.ClientID]
+			if !exist || reqID < op.RequestID {
+				if op.Op == OpPut {
+					kv.db[op.Key] = op.Value
+				} else if op.Op == OpAppend {
+					kv.db[op.Key] += op.Value
 				}
+				kv.clerkID2reqID[op.ClientID] = op.RequestID
+			}
+			kv.mu.Unlock()
+
+			mID := MergeID{op.ClientID, op.RequestID}
+			if appliedCh, exist := kv.appliedChs[mID]; exist {
+				close(*appliedCh)
+				kv.mu.Lock()
+				delete(kv.appliedChs, mID)
 				kv.mu.Unlock()
 			}
+			DPrintf("kv %v done %v", kv.me, applyMsg)
 		}
 	}()
 

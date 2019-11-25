@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"labgob"
 	"labrpc"
 	"log"
@@ -10,6 +11,7 @@ import (
 )
 
 const Debug = 0
+const boundRatio = 0.9
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -43,10 +45,11 @@ type MergeID struct {
 }
 
 type KVServer struct {
-	mu      sync.Mutex
-	me      int
-	rf      *raft.Raft
-	applyCh chan raft.ApplyMsg
+	mu        sync.Mutex
+	me        int
+	rf        *raft.Raft
+	applyCh   chan raft.ApplyMsg
+	persister *raft.Persister
 
 	maxraftstate int // snapshot if log grows this big
 
@@ -125,6 +128,43 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	DPrintf("kv %v reply: %v", kv.me, reply)
 }
 
+func (kv *KVServer) checkSnapshot() bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	return kv.maxraftstate > 0 && float64(kv.persister.RaftStateSize()) >= float64(kv.maxraftstate)*boundRatio
+}
+
+func (kv *KVServer) Snapshot(idx int) {
+	if !kv.checkSnapshot() {
+		return
+	}
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(kv.db)
+	e.Encode(kv.clerkID2reqID)
+	kv.rf.Compaction(idx, w.Bytes())
+}
+
+func (kv *KVServer) readSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) == 0 {
+		return
+	}
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+
+	var db map[string]string
+	var clerkID2reqID map[int64]int64
+
+	if d.Decode(&db) != nil || d.Decode(&clerkID2reqID) != nil {
+		DPrintf("readSnapshot decode error")
+	} else {
+		kv.mu.Lock()
+		kv.db = db
+		kv.clerkID2reqID = clerkID2reqID
+		kv.mu.Unlock()
+	}
+}
+
 //
 // the tester calls Kill() when a KVServer instance won't
 // be needed again. you are not required to do anything
@@ -164,11 +204,14 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.persister = persister
 
 	kv.db = make(map[string]string)
 	kv.clerkID2reqID = make(map[int64]int64)
 	kv.appliedChs = make(map[MergeID]*chan struct{})
 	kv.killCh = make(chan struct{}, 1)
+
+	kv.readSnapshot(kv.persister.ReadSnapshot())
 
 	// You may need initialization code here.
 	go func() {
@@ -180,28 +223,34 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 			case applyMsg = <-kv.applyCh:
 			}
 			DPrintf("kv %v apply: %v", kv.me, applyMsg)
-			op := applyMsg.Command.(Op)
+			if applyMsg.CommandValid {
+				op := applyMsg.Command.(Op)
 
-			kv.mu.Lock()
-			reqID, exist := kv.clerkID2reqID[op.ClientID]
-			if !exist || reqID < op.RequestID {
-				if op.Op == OpPut {
-					kv.db[op.Key] = op.Value
-				} else if op.Op == OpAppend {
-					kv.db[op.Key] += op.Value
+				kv.mu.Lock()
+				reqID, exist := kv.clerkID2reqID[op.ClientID]
+				if !exist || reqID < op.RequestID {
+					if op.Op == OpPut {
+						kv.db[op.Key] = op.Value
+					} else if op.Op == OpAppend {
+						kv.db[op.Key] += op.Value
+					}
+					kv.clerkID2reqID[op.ClientID] = op.RequestID
 				}
-				kv.clerkID2reqID[op.ClientID] = op.RequestID
-			}
-			kv.mu.Unlock()
+				kv.mu.Unlock()
 
-			mID := MergeID{op.ClientID, op.RequestID}
-			kv.mu.Lock()
-			if appliedCh, exist := kv.appliedChs[mID]; exist {
-				close(*appliedCh)
-				delete(kv.appliedChs, mID)
+				mID := MergeID{op.ClientID, op.RequestID}
+				kv.mu.Lock()
+				if appliedCh, exist := kv.appliedChs[mID]; exist {
+					close(*appliedCh)
+					delete(kv.appliedChs, mID)
+				}
+				kv.mu.Unlock()
+
+				kv.Snapshot(applyMsg.CommandIndex)
+				DPrintf("kv %v done %v", kv.me, applyMsg)
+			} else if applyMsg.UseSnapShot {
+				kv.readSnapshot(applyMsg.Snapshot)
 			}
-			kv.mu.Unlock()
-			DPrintf("kv %v done %v", kv.me, applyMsg)
 		}
 	}()
 
